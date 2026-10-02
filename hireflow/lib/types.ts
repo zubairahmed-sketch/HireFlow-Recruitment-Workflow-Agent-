@@ -49,6 +49,7 @@ export interface Application {
   job_posting_id: string;
   resume_storage_path: string;
   resume_text: string | null;
+  n8n_resume_url: string | null;  // URL to resume the paused n8n workflow execution
   status: ApplicationStatus;
   created_at: string;
 }
