@@ -68,6 +68,7 @@ CREATE TABLE applications (
   job_posting_id uuid REFERENCES job_postings(id) NOT NULL,
   resume_storage_path text NOT NULL,
   resume_text text,                -- extracted plain text
+  n8n_resume_url text,             -- URL to resume the paused n8n workflow execution
   status text DEFAULT 'received',  -- received | scored | pending_review | approved | rejected | more_info | interview_scheduled
   created_at timestamptz DEFAULT now()
 );

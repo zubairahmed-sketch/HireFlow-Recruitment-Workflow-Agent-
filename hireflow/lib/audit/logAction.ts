@@ -1,3 +1,4 @@
+import type { SupabaseClient } from '@supabase/supabase-js';
 import type { AuditActorType } from '@/lib/types';
 
 /**
@@ -15,7 +16,7 @@ export async function logAction({
   action,
   details,
 }: {
-  supabase: ReturnType<typeof import('@supabase/supabase-js').createClient>;
+  supabase: SupabaseClient;
   applicationId: string | null;
   actorType: AuditActorType;
   actorId: string | null;
