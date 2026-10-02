@@ -1,0 +1,323 @@
+{
+  "name": "HireFlow — Recruitment Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "application-received",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "n1-webhook-trigger",
+      "name": "Webhook — New Application",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "notes": "Entry point. Receives application payload from mock ATS or real ATS (Greenhouse, Workday). Shape: { application_id, candidate_id, job_posting_id } — these are written to Supabase by /api/webhooks/application-received before n8n is called."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.APP_BASE_URL }}/api/applications/extract",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "application_id",
+              "value": "={{ $json.application_id }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n2-extract",
+      "name": "HTTP — Extract Resume Text",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300],
+      "notes": "Calls Next.js backend to download resume from Supabase Storage and extract plain text. Result stored in applications.resume_text."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.APP_BASE_URL }}/api/applications/score",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "application_id",
+              "value": "={{ $('Webhook — New Application').item.json.application_id }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n3-score",
+      "name": "HTTP — Score Resume (LLM Call 1)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [680, 300],
+      "notes": "Calls Next.js backend which assembles job rubric + resume text, calls gpt-4o-mini for structured per-criterion scoring, stores result in resume_scores, sets status=pending_review."
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $env.APP_BASE_URL }}/api/applications/{{ $('Webhook — New Application').item.json.application_id }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "n8n_resume_url",
+              "value": "={{ $execution.resumeUrl }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n4-store-resume-url",
+      "name": "HTTP — Store n8n Resume URL",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [900, 300],
+      "notes": "CRITICAL STEP: Saves the Wait node's unique resume URL to the database. Without this, the paused workflow can NEVER be resumed when a recruiter makes a decision days later. This is the most commonly missed step in this pattern."
+    },
+    {
+      "parameters": {
+        "resume": "webhook",
+        "options": {}
+      },
+      "id": "n5-wait",
+      "name": "Wait — Human Decision Required",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [1120, 300],
+      "notes": "Workflow GENUINELY PAUSES here. Not polling — the execution is frozen until /api/applications/[id]/decision calls this node's resumeUrl. This is what makes the human-in-the-loop pattern real."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.decision }}",
+              "rightValue": "approved",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        },
+        "combineOperation": "all"
+      },
+      "id": "n6-switch-approved",
+      "name": "IF — Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1340, 300],
+      "notes": "Branches on the decision value sent in the resume URL call. Never branches on LLM output."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {},
+          "conditions": [
+            {
+              "leftValue": "={{ $json.decision }}",
+              "rightValue": "rejected",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      },
+      "id": "n7-switch-rejected",
+      "name": "IF — Rejected?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1340, 460],
+      "notes": "Second branch check for rejection. If neither approved nor rejected, falls through to more_info."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.APP_BASE_URL }}/api/applications/{{ $('Webhook — New Application').item.json.application_id }}/interview-slots",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "application_id",
+              "value": "={{ $('Webhook — New Application').item.json.application_id }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "n8-create-slots",
+      "name": "HTTP — Create Interview Slots",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1560, 200],
+      "notes": "Creates 2-3 interview slot rows in the database. Candidate will pick from these."
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.EMAIL_FROM }}",
+        "toEmail": "={{ $('Webhook — New Application').item.json.candidate_email }}",
+        "subject": "Interview Invitation — {{ $('Webhook — New Application').item.json.job_title }}",
+        "emailType": "text",
+        "message": "Hi {{ $('Webhook — New Application').item.json.candidate_name }},\n\nCongratulations! We'd like to invite you to interview for the {{ $('Webhook — New Application').item.json.job_title }} position.\n\nPlease select your preferred interview time: {{ $env.APP_BASE_URL }}/interviews/{{ $('Webhook — New Application').item.json.application_id }}/confirm\n\nBest regards,\nThe Hiring Team",
+        "options": {}
+      },
+      "id": "n9-email-approved",
+      "name": "Email — Interview Invitation",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1780, 200],
+      "notes": "Sends interview invitation email with link to /interviews/[id]/confirm — the candidate-facing slot picker page."
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.EMAIL_FROM }}",
+        "toEmail": "={{ $('Webhook — New Application').item.json.candidate_email }}",
+        "subject": "Your application for {{ $('Webhook — New Application').item.json.job_title }}",
+        "emailType": "text",
+        "message": "Hi {{ $('Webhook — New Application').item.json.candidate_name }},\n\nThank you for your interest in the {{ $('Webhook — New Application').item.json.job_title }} position.\n\nAfter careful review, we've decided to move forward with other candidates whose experience more closely matches our current needs.\n\nWe appreciate the time you invested in applying and wish you the best in your search.\n\nBest regards,\nThe Hiring Team",
+        "options": {}
+      },
+      "id": "n10-email-rejected",
+      "name": "Email — Rejection",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1560, 440],
+      "notes": "Rejection email. Only sent after explicit human decision — never triggered by LLM output."
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.EMAIL_FROM }}",
+        "toEmail": "={{ $('Webhook — New Application').item.json.candidate_email }}",
+        "subject": "Additional information needed — {{ $('Webhook — New Application').item.json.job_title }}",
+        "emailType": "text",
+        "message": "Hi {{ $('Webhook — New Application').item.json.candidate_name }},\n\nThank you for applying to the {{ $('Webhook — New Application').item.json.job_title }} position.\n\nWe'd like to learn more before moving forward. A member of our team will be in touch shortly with specific questions.\n\nBest regards,\nThe Hiring Team",
+        "options": {}
+      },
+      "id": "n11-email-moreinfo",
+      "name": "Email — More Info Request",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1560, 600],
+      "notes": "Sent when recruiter requests more information. Workflow can loop back to Wait after response."
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { \"status\": \"received\", \"application_id\": $json.application_id } }}",
+        "options": {}
+      },
+      "id": "n12-respond",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [460, 140],
+      "notes": "Sends immediate 200 response to the ATS webhook trigger so it doesn't time out waiting."
+    }
+  ],
+  "connections": {
+    "Webhook — New Application": {
+      "main": [
+        [
+          { "node": "Respond to Webhook", "type": "main", "index": 0 },
+          { "node": "HTTP — Extract Resume Text", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "HTTP — Extract Resume Text": {
+      "main": [
+        [{ "node": "HTTP — Score Resume (LLM Call 1)", "type": "main", "index": 0 }]
+      ]
+    },
+    "HTTP — Score Resume (LLM Call 1)": {
+      "main": [
+        [{ "node": "HTTP — Store n8n Resume URL", "type": "main", "index": 0 }]
+      ]
+    },
+    "HTTP — Store n8n Resume URL": {
+      "main": [
+        [{ "node": "Wait — Human Decision Required", "type": "main", "index": 0 }]
+      ]
+    },
+    "Wait — Human Decision Required": {
+      "main": [
+        [
+          { "node": "IF — Approved?", "type": "main", "index": 0 },
+          { "node": "IF — Rejected?", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "IF — Approved?": {
+      "main": [
+        [{ "node": "HTTP — Create Interview Slots", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "IF — Rejected?": {
+      "main": [
+        [{ "node": "Email — Rejection", "type": "main", "index": 0 }],
+        [{ "node": "Email — More Info Request", "type": "main", "index": 0 }]
+      ]
+    },
+    "HTTP — Create Interview Slots": {
+      "main": [
+        [{ "node": "Email — Interview Invitation", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "description": "HireFlow recruitment pipeline — webhook trigger → resume extract → LLM score → Wait (human review) → branch on decision → email. The Wait node genuinely pauses until the recruiter approves/rejects via the dashboard.",
+    "templateCredsSetupCompleted": false
+  },
+  "pinData": {}
+}
