@@ -1,0 +1,166 @@
+{
+  "name": "HireFlow — Reminder: Unconfirmed Interview Slots",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 24
+            }
+          ]
+        }
+      },
+      "id": "r1-schedule",
+      "name": "Schedule — Daily Check",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [240, 300],
+      "notes": "Runs once daily. Checks for interview slots that have been in 'offered' status for more than 48 hours without a candidate response."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.APP_BASE_URL }}/api/interviews/reminders/pending",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $env.N8N_SERVICE_TOKEN }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "r2-fetch-pending",
+      "name": "HTTP — Fetch Unconfirmed Slots",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [460, 300],
+      "notes": "Fetches all interview slots where status='offered' and proposed_start is within 48h OR slot was created 48h+ ago with no confirmation."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {},
+          "conditions": [
+            {
+              "leftValue": "={{ $json.data.length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ]
+        }
+      },
+      "id": "r3-check-any",
+      "name": "IF — Any Pending?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [680, 300],
+      "notes": "Only proceed if there are actually unconfirmed slots to remind about."
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "data",
+        "options": {}
+      },
+      "id": "r4-split",
+      "name": "Split — Each Slot",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [900, 200],
+      "notes": "Processes each unconfirmed application individually so each gets its own reminder email."
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $env.EMAIL_FROM }}",
+        "toEmail": "={{ $json.candidate_email }}",
+        "subject": "Reminder: Please select your interview time — {{ $json.job_title }}",
+        "emailType": "text",
+        "message": "Hi {{ $json.candidate_name }},\n\nJust a quick reminder — we're still waiting for you to select your preferred interview time for the {{ $json.job_title }} position.\n\nPlease pick a slot here: {{ $env.APP_BASE_URL }}/interviews/{{ $json.application_id }}/confirm\n\nIf you're no longer interested or need different times, please reply to this email.\n\nBest regards,\nThe Hiring Team",
+        "options": {}
+      },
+      "id": "r5-send-reminder",
+      "name": "Email — Send Reminder",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1120, 200],
+      "notes": "Sends a reminder email to the candidate with the same confirm link. Logged to audit_log via the next node."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.APP_BASE_URL }}/api/interviews/reminders/log",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "application_id",
+              "value": "={{ $json.application_id }}"
+            },
+            {
+              "name": "action",
+              "value": "reminder_sent"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "r6-log-reminder",
+      "name": "HTTP — Log Reminder to Audit",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1340, 200],
+      "notes": "Every reminder is logged to audit_log so recruiters can see exactly when and how many reminders were sent per candidate."
+    }
+  ],
+  "connections": {
+    "Schedule — Daily Check": {
+      "main": [
+        [{ "node": "HTTP — Fetch Unconfirmed Slots", "type": "main", "index": 0 }]
+      ]
+    },
+    "HTTP — Fetch Unconfirmed Slots": {
+      "main": [
+        [{ "node": "IF — Any Pending?", "type": "main", "index": 0 }]
+      ]
+    },
+    "IF — Any Pending?": {
+      "main": [
+        [{ "node": "Split — Each Slot", "type": "main", "index": 0 }],
+        []
+      ]
+    },
+    "Split — Each Slot": {
+      "main": [
+        [{ "node": "Email — Send Reminder", "type": "main", "index": 0 }]
+      ]
+    },
+    "Email — Send Reminder": {
+      "main": [
+        [{ "node": "HTTP — Log Reminder to Audit", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "description": "HireFlow reminder sub-workflow. Runs daily, checks for unconfirmed interview slots older than 48h, sends reminder emails, logs to audit_log. Import this as a separate workflow in n8n alongside the main recruitment-pipeline workflow."
+  },
+  "pinData": {}
+}
