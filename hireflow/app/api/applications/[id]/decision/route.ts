@@ -1,23 +1,18 @@
 import { NextResponse } from 'next/server';
-import { createClient } from '@/lib/supabase/server';
-import { createServiceRoleClient } from '@/lib/supabase/server';
+import { auth } from '@clerk/nextjs/server';
+import { getDb } from '@/lib/db';
+import { applications, humanDecisions } from '@/lib/db/schema';
+import { eq } from 'drizzle-orm';
 import { logAction } from '@/lib/audit/logAction';
 import { z } from 'zod/v4';
 
 /**
  * POST /api/applications/[id]/decision
- * 
- * Records a human decision (approve/reject/more_info) and then calls
- * n8n's resume-webhook to unfreeze the paused workflow.
- * 
- * This is the bridge between the human review UI and n8n's Wait node.
- * Three things happen in order:
- * 1. Insert into human_decisions
- * 2. Log to audit_log
- * 3. Call the saved n8n_resume_url with the decision value
- * 
- * Per Rule 2: The decision is always a real human action, never an LLM output.
- * Per Rule 4: This triggers n8n's real Wait-for-Webhook resume, not polling.
+ *
+ * Records a human decision (approve/reject/more_info), updates application status,
+ * then calls n8n's resume URL to unfreeze the paused workflow.
+ *
+ * This is the bridge between human review and n8n orchestration.
  */
 
 const decisionSchema = z.object({
@@ -30,20 +25,12 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
-    const { id: applicationId } = await params;
-    const supabase = await createClient();
-
-    // 1. Authenticate the user
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser();
-
-    if (authError || !user) {
+    const { userId } = await auth();
+    if (!userId) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
     }
 
-    // 2. Parse and validate the decision
+    const { id: applicationId } = await params;
     const body = await request.json();
     const parsed = decisionSchema.safeParse(body);
 
@@ -55,133 +42,77 @@ export async function POST(
     }
 
     const { decision, notes } = parsed.data;
+    const db = getDb();
 
-    // Use service role client for cross-table writes
-    const serviceClient = createServiceRoleClient();
+    // 1. Verify application exists and get resume URL
+    const [application] = await db
+      .select()
+      .from(applications)
+      .where(eq(applications.id, applicationId))
+      .limit(1);
 
-    // 3. Verify the application exists and is in a reviewable state
-    const { data: application, error: appError } = await serviceClient
-      .from('applications')
-      .select('id, status, n8n_resume_url, user_id')
-      .eq('id', applicationId)
-      .single();
-
-    if (appError || !application) {
-      return NextResponse.json(
-        { error: 'Application not found' },
-        { status: 404 }
-      );
+    if (!application) {
+      return NextResponse.json({ error: 'Application not found' }, { status: 404 });
     }
 
-    if (application.status !== 'pending_review' && application.status !== 'more_info') {
-      return NextResponse.json(
-        {
-          error: `Application is in '${application.status}' status and cannot be reviewed right now`,
-        },
-        { status: 409 }
-      );
-    }
-
-    // 4. Insert the human decision
-    const { data: decisionRecord, error: decisionError } = await serviceClient
-      .from('human_decisions')
-      .insert({
-        application_id: applicationId,
-        decided_by: user.id,
+    // 2. Record the human decision
+    const [decisionRecord] = await db
+      .insert(humanDecisions)
+      .values({
+        applicationId,
+        decidedBy: userId,
         decision,
         notes: notes ?? null,
       })
-      .select('id, decided_at')
-      .single();
+      .returning();
 
-    if (decisionError || !decisionRecord) {
-      console.error('[decision] Failed to record decision:', decisionError?.message);
-      return NextResponse.json(
-        { error: 'Failed to record decision' },
-        { status: 500 }
-      );
-    }
+    // 3. Update application status
+    await db
+      .update(applications)
+      .set({ status: decision })
+      .where(eq(applications.id, applicationId));
 
-    // 5. Update application status
-    const statusMap: Record<string, string> = {
-      approved: 'approved',
-      rejected: 'rejected',
-      more_info: 'more_info',
-    };
-
-    const { error: updateError } = await serviceClient
-      .from('applications')
-      .update({ status: statusMap[decision] })
-      .eq('id', applicationId);
-
-    if (updateError) {
-      console.error('[decision] Failed to update status:', updateError.message);
-    }
-
-    // 6. Audit log
+    // 4. Audit log
     await logAction({
-      supabase: serviceClient,
       applicationId,
       actorType: 'human',
-      actorId: user.id,
+      actorId: userId,
       action: 'decision_recorded',
       details: {
         decision,
-        notes: notes ?? null,
         decision_id: decisionRecord.id,
-        decided_at: decisionRecord.decided_at,
+        notes: notes ?? null,
       },
     });
 
-    // 7. Resume the n8n workflow by calling the saved resume URL
-    let n8nResumed = false;
-    if (application.n8n_resume_url) {
+    // 5. Resume n8n workflow (the most important step)
+    if (application.n8nResumeUrl) {
       try {
-        const n8nResponse = await fetch(application.n8n_resume_url, {
+        const n8nResponse = await fetch(application.n8nResumeUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            decision,
-            application_id: applicationId,
-            decided_by: user.id,
-            notes: notes ?? null,
-          }),
+          body: JSON.stringify({ decision, notes, application_id: applicationId }),
         });
-        n8nResumed = n8nResponse.ok;
 
-        if (!n8nResumed) {
-          console.error(
-            '[decision] n8n resume call failed:',
-            n8nResponse.status,
-            await n8nResponse.text()
-          );
-        }
-
-        // Audit the n8n resume attempt
         await logAction({
-          supabase: serviceClient,
           applicationId,
           actorType: 'system',
           actorId: 'api:decision',
           action: 'n8n_workflow_resumed',
           details: {
-            resume_url: application.n8n_resume_url,
-            success: n8nResumed,
-            decision,
+            resume_url: application.n8nResumeUrl,
+            n8n_status: n8nResponse.status,
           },
         });
       } catch (n8nErr) {
-        console.error('[decision] Failed to call n8n resume URL:', n8nErr);
-        // Don't fail the decision recording — the decision is saved even if n8n is down
+        console.error('[decision] Failed to resume n8n:', n8nErr);
         await logAction({
-          supabase: serviceClient,
           applicationId,
           actorType: 'system',
           actorId: 'api:decision',
-          action: 'n8n_workflow_resume_failed',
+          action: 'n8n_resume_failed',
           details: {
-            resume_url: application.n8n_resume_url,
-            error: String(n8nErr),
+            error: n8nErr instanceof Error ? n8nErr.message : 'Unknown error',
           },
         });
       }
@@ -189,18 +120,14 @@ export async function POST(
 
     return NextResponse.json({
       data: {
+        decision_id: decisionRecord.id,
         application_id: applicationId,
         decision,
-        decision_id: decisionRecord.id,
-        decided_at: decisionRecord.decided_at,
-        n8n_resumed: n8nResumed,
+        status: decision,
       },
     });
   } catch (err) {
-    console.error('[decision] Unexpected error:', err);
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    );
+    console.error('[decision] Error:', err);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }

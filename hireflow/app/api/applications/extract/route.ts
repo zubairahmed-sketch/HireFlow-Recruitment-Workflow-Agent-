@@ -1,21 +1,20 @@
 import { NextResponse } from 'next/server';
-import { createServiceRoleClient } from '@/lib/supabase/server';
-import { extractResumeText } from '@/lib/resume/extractText';
+import { getDb } from '@/lib/db';
+import { applications } from '@/lib/db/schema';
+import { eq } from 'drizzle-orm';
+import { extractText } from '@/lib/resume/extractText';
 import { logAction } from '@/lib/audit/logAction';
 import { z } from 'zod/v4';
 
 /**
  * POST /api/applications/extract
- * 
+ *
  * Called by n8n after a new application is received.
- * Downloads the resume from Supabase Storage, extracts plain text,
- * and stores it in applications.resume_text.
- * 
- * This route does one bounded thing and returns — per Rule 1.
+ * Downloads the resume from the stored URL and extracts plain text.
  */
 
 const extractSchema = z.object({
-  application_id: z.string().uuid('Valid application ID is required'),
+  application_id: z.string().uuid(),
 });
 
 export async function POST(request: Request) {
@@ -31,89 +30,78 @@ export async function POST(request: Request) {
     }
 
     const { application_id } = parsed.data;
-    const supabase = createServiceRoleClient();
+    const db = getDb();
 
-    // 1. Fetch the application
-    const { data: application, error: appError } = await supabase
-      .from('applications')
-      .select('id, resume_storage_path, resume_text, user_id')
-      .eq('id', application_id)
-      .single();
+    // 1. Get the application
+    const [application] = await db
+      .select()
+      .from(applications)
+      .where(eq(applications.id, application_id))
+      .limit(1);
 
-    if (appError || !application) {
+    if (!application) {
       return NextResponse.json(
         { error: 'Application not found' },
         { status: 404 }
       );
     }
 
-    // Skip extraction if already done
-    if (application.resume_text) {
-      return NextResponse.json({
-        data: {
-          application_id,
-          resume_text: application.resume_text,
-          already_extracted: true,
-        },
-      });
-    }
+    // 2. Download the resume from the URL
+    const resumeUrl = application.resumeStoragePath;
+    const response = await fetch(resumeUrl);
 
-    // 2. Download the resume from Supabase Storage
-    const { data: fileData, error: downloadError } = await supabase.storage
-      .from('resumes')
-      .download(application.resume_storage_path);
-
-    if (downloadError || !fileData) {
-      console.error('[extract] Failed to download resume:', downloadError?.message);
+    if (!response.ok) {
       return NextResponse.json(
-        { error: 'Failed to download resume from storage' },
-        { status: 500 }
+        { error: `Failed to download resume from ${resumeUrl}` },
+        { status: 502 }
       );
     }
 
-    // 3. Extract text from the resume file
-    const arrayBuffer = await fileData.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
-    const fileName = application.resume_storage_path.split('/').pop() || 'resume.pdf';
+    const fileBuffer = Buffer.from(await response.arrayBuffer());
 
-    const resumeText = await extractResumeText(buffer, fileName);
+    // Determine file type from URL or content-type
+    const contentType = response.headers.get('content-type') ?? '';
+    const isDocx =
+      resumeUrl.endsWith('.docx') ||
+      contentType.includes('wordprocessingml');
 
-    // 4. Store the extracted text
-    const { error: updateError } = await supabase
-      .from('applications')
-      .update({ resume_text: resumeText })
-      .eq('id', application_id);
+    // 3. Extract text
+    const resumeText = await extractText(fileBuffer, isDocx ? 'docx' : 'pdf');
 
-    if (updateError) {
-      console.error('[extract] Failed to store resume text:', updateError.message);
+    if (!resumeText || resumeText.trim().length === 0) {
       return NextResponse.json(
-        { error: 'Failed to store extracted text' },
-        { status: 500 }
+        { error: 'No text could be extracted from the resume' },
+        { status: 422 }
       );
     }
+
+    // 4. Store extracted text
+    await db
+      .update(applications)
+      .set({ resumeText })
+      .where(eq(applications.id, application_id));
 
     // 5. Audit log
     await logAction({
-      supabase,
       applicationId: application_id,
       actorType: 'system',
       actorId: 'api:extract',
       action: 'resume_text_extracted',
       details: {
-        text_length: resumeText.length,
-        file_name: fileName,
+        char_count: resumeText.length,
+        source_type: isDocx ? 'docx' : 'pdf',
       },
     });
 
     return NextResponse.json({
       data: {
         application_id,
-        resume_text: resumeText,
-        already_extracted: false,
+        char_count: resumeText.length,
+        preview: resumeText.slice(0, 200) + '…',
       },
     });
   } catch (err) {
-    console.error('[extract] Unexpected error:', err);
+    console.error('[extract] Error:', err);
     return NextResponse.json(
       { error: 'Internal server error' },
       { status: 500 }

@@ -1,25 +1,21 @@
 import { NextResponse } from 'next/server';
-import { createServiceRoleClient } from '@/lib/supabase/server';
+import { getDb } from '@/lib/db';
+import { applications, jobPostings, resumeScores } from '@/lib/db/schema';
+import { eq } from 'drizzle-orm';
 import { scoreResume } from '@/lib/scoring/scoreResume';
 import { logAction } from '@/lib/audit/logAction';
 import { logTokenUsage } from '@/lib/openai/logTokenUsage';
 import { z } from 'zod/v4';
-import type { JobCriterion } from '@/lib/types';
 
 /**
  * POST /api/applications/score
- * 
- * Called by n8n after resume text has been extracted.
- * Assembles the job's criteria + resume text, calls the LLM (Call 1),
- * stores the structured score, and sets status to 'pending_review'.
- * 
- * Per Rule 2: Returns a structured recommendation ONLY — never triggers
- *             any candidate-facing action.
- * Per Rule 3: Always returns full structured output with evidence per criterion.
+ *
+ * Called by n8n after resume text extraction.
+ * Scores the resume against the job's structured criteria (Call 1).
  */
 
 const scoreSchema = z.object({
-  application_id: z.string().uuid('Valid application ID is required'),
+  application_id: z.string().uuid(),
 });
 
 export async function POST(request: Request) {
@@ -35,121 +31,95 @@ export async function POST(request: Request) {
     }
 
     const { application_id } = parsed.data;
-    const supabase = createServiceRoleClient();
+    const db = getDb();
 
-    // 1. Fetch the application with its resume text and job posting criteria
-    const { data: application, error: appError } = await supabase
-      .from('applications')
-      .select('id, resume_text, job_posting_id, user_id, status')
-      .eq('id', application_id)
-      .single();
+    // 1. Get the application with resume text
+    const [application] = await db
+      .select()
+      .from(applications)
+      .where(eq(applications.id, application_id))
+      .limit(1);
 
-    if (appError || !application) {
+    if (!application) {
+      return NextResponse.json({ error: 'Application not found' }, { status: 404 });
+    }
+
+    if (!application.resumeText) {
       return NextResponse.json(
-        { error: 'Application not found' },
-        { status: 404 }
+        { error: 'Resume text not yet extracted. Run /extract first.' },
+        { status: 422 }
       );
     }
 
-    if (!application.resume_text) {
-      return NextResponse.json(
-        { error: 'Resume text has not been extracted yet. Call /api/applications/extract first.' },
-        { status: 400 }
-      );
+    // 2. Get the job posting criteria
+    const [job] = await db
+      .select()
+      .from(jobPostings)
+      .where(eq(jobPostings.id, application.jobPostingId))
+      .limit(1);
+
+    if (!job) {
+      return NextResponse.json({ error: 'Job posting not found' }, { status: 404 });
     }
 
-    // 2. Fetch the job posting's criteria
-    const { data: jobPosting, error: jobError } = await supabase
-      .from('job_postings')
-      .select('criteria')
-      .eq('id', application.job_posting_id)
-      .single();
+    const criteria = job.criteria as { name: string; description?: string; weight?: number }[];
 
-    if (jobError || !jobPosting) {
-      return NextResponse.json(
-        { error: 'Associated job posting not found' },
-        { status: 404 }
-      );
-    }
-
-    const criteria = jobPosting.criteria as JobCriterion[];
-
-    // 3. Call the LLM for structured scoring (Call 1)
-    const scoringResult = await scoreResume({
+    // 3. Call 1: Score resume against criteria
+    const result = await scoreResume({
       criteria,
-      resumeText: application.resume_text,
+      resumeText: application.resumeText,
     });
 
-    // 4. Store the score in resume_scores
-    const { data: scoreRecord, error: scoreError } = await supabase
-      .from('resume_scores')
-      .insert({
-        application_id,
-        criteria_results: scoringResult.criteria_results,
-        overall_score: scoringResult.overall_score,
-        recommendation: scoringResult.recommendation,
+    // 4. Store the score
+    const [score] = await db
+      .insert(resumeScores)
+      .values({
+        applicationId: application_id,
+        criteriaResults: result.criteria_results,
+        overallScore: String(result.overall_score),
+        recommendation: result.recommendation,
       })
-      .select('id')
-      .single();
+      .returning();
 
-    if (scoreError || !scoreRecord) {
-      console.error('[score] Failed to store score:', scoreError?.message);
-      return NextResponse.json(
-        { error: 'Failed to store scoring result' },
-        { status: 500 }
-      );
-    }
+    // 5. Update application status
+    await db
+      .update(applications)
+      .set({ status: 'pending_review' })
+      .where(eq(applications.id, application_id));
 
-    // 5. Update application status to 'pending_review'
-    const { error: updateError } = await supabase
-      .from('applications')
-      .update({ status: 'pending_review' })
-      .eq('id', application_id);
-
-    if (updateError) {
-      console.error('[score] Failed to update status:', updateError.message);
-    }
-
-    // 6. Log token usage (Rule 11)
+    // 6. Log token usage
     await logTokenUsage({
-      supabase,
-      userId: application.user_id,
+      userId: application.userId,
       callType: 'resume_scoring',
-      tokensUsed: scoringResult.tokensUsed,
+      tokensUsed: result.tokensUsed,
     });
 
     // 7. Audit log
     await logAction({
-      supabase,
       applicationId: application_id,
       actorType: 'llm',
       actorId: 'gpt-4o-mini',
       action: 'resume_scored',
       details: {
-        score_id: scoreRecord.id,
-        overall_score: scoringResult.overall_score,
-        recommendation: scoringResult.recommendation,
-        criteria_count: scoringResult.criteria_results.length,
-        tokens_used: scoringResult.tokensUsed,
+        score_id: score.id,
+        overall_score: result.overall_score,
+        recommendation: result.recommendation,
+        criteria_count: result.criteria_results.length,
+        tokens_used: result.tokensUsed,
       },
     });
 
-    // 8. Return the scoring result
     return NextResponse.json({
       data: {
         application_id,
-        score_id: scoreRecord.id,
-        criteria_results: scoringResult.criteria_results,
-        overall_score: scoringResult.overall_score,
-        recommendation: scoringResult.recommendation,
-        status: 'pending_review',
+        score_id: score.id,
+        overall_score: result.overall_score,
+        recommendation: result.recommendation,
+        criteria_results: result.criteria_results,
       },
     });
   } catch (err) {
-    console.error('[score] Unexpected error:', err);
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    );
+    console.error('[score] Error:', err);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }

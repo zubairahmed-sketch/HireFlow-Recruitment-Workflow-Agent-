@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server';
-import { createClient } from '@/lib/supabase/server';
-import { createServiceRoleClient } from '@/lib/supabase/server';
+import { getDb } from '@/lib/db';
+import { applications, candidates, jobPostings, feedbackSummaries } from '@/lib/db/schema';
+import { eq } from 'drizzle-orm';
 import { generateFeedbackSummary } from '@/lib/feedback/generateSummary';
 import { logAction } from '@/lib/audit/logAction';
 import { logTokenUsage } from '@/lib/openai/logTokenUsage';
@@ -8,10 +9,7 @@ import { z } from 'zod/v4';
 
 /**
  * POST /api/feedback/generate
- *
- * Called by n8n after an interview stage completes.
- * Generates a structured feedback summary (Call 3) from interview notes.
- * Stores the result in feedback_summaries.
+ * Call 3: Post-interview feedback summary generation.
  */
 
 const feedbackSchema = z.object({
@@ -32,71 +30,45 @@ export async function POST(request: Request) {
     }
 
     const { application_id, interview_notes } = parsed.data;
-    const serviceClient = createServiceRoleClient();
+    const db = getDb();
 
-    // Fetch application + candidate + job info
-    const { data: application } = await serviceClient
-      .from('applications')
-      .select('id, candidate_id, job_posting_id, user_id')
-      .eq('id', application_id)
-      .single();
+    const [application] = await db
+      .select()
+      .from(applications)
+      .where(eq(applications.id, application_id))
+      .limit(1);
 
     if (!application) {
-      return NextResponse.json(
-        { error: 'Application not found' },
-        { status: 404 }
-      );
+      return NextResponse.json({ error: 'Application not found' }, { status: 404 });
     }
 
-    const [candidateRes, jobRes] = await Promise.all([
-      serviceClient
-        .from('candidates')
-        .select('full_name')
-        .eq('id', application.candidate_id)
-        .single(),
-      serviceClient
-        .from('job_postings')
-        .select('title')
-        .eq('id', application.job_posting_id)
-        .single(),
+    const [candidateRows, jobRows] = await Promise.all([
+      db.select().from(candidates).where(eq(candidates.id, application.candidateId)),
+      db.select().from(jobPostings).where(eq(jobPostings.id, application.jobPostingId)),
     ]);
 
     // Call 3: Generate feedback summary
     const result = await generateFeedbackSummary({
       interviewNotes: interview_notes,
-      candidateName: candidateRes.data?.full_name ?? 'Candidate',
-      jobTitle: jobRes.data?.title ?? 'Position',
+      candidateName: candidateRows[0]?.fullName ?? 'Candidate',
+      jobTitle: jobRows[0]?.title ?? 'Position',
     });
 
-    // Store in feedback_summaries
-    const { data: summaryRecord, error: insertError } = await serviceClient
-      .from('feedback_summaries')
-      .insert({
-        application_id,
-        summary_text: result.summary_text,
+    const [summaryRecord] = await db
+      .insert(feedbackSummaries)
+      .values({
+        applicationId: application_id,
+        summaryText: result.summary_text,
       })
-      .select('id, generated_at')
-      .single();
+      .returning();
 
-    if (insertError) {
-      console.error('[feedback] Insert error:', insertError.message);
-      return NextResponse.json(
-        { error: 'Failed to store feedback summary' },
-        { status: 500 }
-      );
-    }
-
-    // Log token usage (Rule 11)
     await logTokenUsage({
-      supabase: serviceClient,
-      userId: application.user_id,
+      userId: application.userId,
       callType: 'feedback_summary',
       tokensUsed: result.tokensUsed,
     });
 
-    // Audit log
     await logAction({
-      supabase: serviceClient,
       applicationId: application_id,
       actorType: 'llm',
       actorId: 'gpt-4o-mini',
@@ -112,14 +84,11 @@ export async function POST(request: Request) {
         summary_id: summaryRecord.id,
         application_id,
         summary_text: result.summary_text,
-        generated_at: summaryRecord.generated_at,
+        generated_at: summaryRecord.generatedAt,
       },
     });
   } catch (err) {
-    console.error('[feedback] Unexpected error:', err);
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    );
+    console.error('[feedback] Error:', err);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }

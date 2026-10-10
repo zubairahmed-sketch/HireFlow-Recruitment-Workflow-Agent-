@@ -1,14 +1,14 @@
 import { NextResponse } from 'next/server';
-import { createServiceRoleClient } from '@/lib/supabase/server';
+import { getDb } from '@/lib/db';
+import { interviewSlots, applications, candidates, jobPostings } from '@/lib/db/schema';
+import { eq, and, ne } from 'drizzle-orm';
+import { logAction } from '@/lib/audit/logAction';
 import { z } from 'zod/v4';
 
 /**
- * POST /api/interviews/[id]/confirm
- * 
- * Candidate-facing endpoint — accessed via emailed link, NO auth required.
- * The candidate clicks a link to confirm one of the offered time slots.
- * 
- * [id] here is the interview_slot id, not the application id.
+ * GET /api/interviews/[id]/confirm — returns available slots for a candidate.
+ * POST /api/interviews/[id]/confirm — candidate confirms a slot.
+ * [id] is the application ID. No auth — accessed via emailed link.
  */
 
 const confirmSchema = z.object({
@@ -32,156 +32,105 @@ export async function POST(
     }
 
     const { slot_id } = parsed.data;
-    const supabase = createServiceRoleClient();
+    const db = getDb();
 
-    // 1. Verify the slot exists and belongs to this application
-    const { data: slot, error: slotError } = await supabase
-      .from('interview_slots')
-      .select('id, application_id, status')
-      .eq('id', slot_id)
-      .eq('application_id', applicationId)
-      .single();
+    // 1. Verify slot exists and belongs to this application
+    const [slot] = await db
+      .select()
+      .from(interviewSlots)
+      .where(
+        and(
+          eq(interviewSlots.id, slot_id),
+          eq(interviewSlots.applicationId, applicationId)
+        )
+      )
+      .limit(1);
 
-    if (slotError || !slot) {
-      return NextResponse.json(
-        { error: 'Interview slot not found' },
-        { status: 404 }
-      );
+    if (!slot) {
+      return NextResponse.json({ error: 'Interview slot not found' }, { status: 404 });
     }
 
     if (slot.status === 'confirmed') {
-      return NextResponse.json(
-        { error: 'This slot has already been confirmed' },
-        { status: 409 }
-      );
-    }
-
-    if (slot.status === 'declined') {
-      return NextResponse.json(
-        { error: 'This slot has been declined' },
-        { status: 409 }
-      );
+      return NextResponse.json({ error: 'Already confirmed' }, { status: 409 });
     }
 
     // 2. Confirm the selected slot
-    const { error: confirmError } = await supabase
-      .from('interview_slots')
-      .update({ status: 'confirmed' })
-      .eq('id', slot_id);
+    await db
+      .update(interviewSlots)
+      .set({ status: 'confirmed' })
+      .where(eq(interviewSlots.id, slot_id));
 
-    if (confirmError) {
-      console.error('[confirm] Failed to confirm slot:', confirmError.message);
-      return NextResponse.json(
-        { error: 'Failed to confirm interview slot' },
-        { status: 500 }
+    // 3. Decline other offered slots
+    await db
+      .update(interviewSlots)
+      .set({ status: 'declined' })
+      .where(
+        and(
+          eq(interviewSlots.applicationId, applicationId),
+          ne(interviewSlots.id, slot_id),
+          eq(interviewSlots.status, 'offered')
+        )
       );
-    }
-
-    // 3. Decline all other offered slots for this application
-    await supabase
-      .from('interview_slots')
-      .update({ status: 'declined' })
-      .eq('application_id', applicationId)
-      .neq('id', slot_id)
-      .eq('status', 'offered');
 
     // 4. Update application status
-    await supabase
-      .from('applications')
-      .update({ status: 'interview_scheduled' })
-      .eq('id', applicationId);
+    await db
+      .update(applications)
+      .set({ status: 'interview_scheduled' })
+      .where(eq(applications.id, applicationId));
 
     // 5. Audit log
-    const { logAction } = await import('@/lib/audit/logAction');
     await logAction({
-      supabase,
       applicationId,
       actorType: 'system',
       actorId: 'candidate:confirm',
       action: 'interview_slot_confirmed',
-      details: {
-        confirmed_slot_id: slot_id,
-      },
+      details: { confirmed_slot_id: slot_id },
     });
 
     return NextResponse.json({
-      data: {
-        slot_id,
-        application_id: applicationId,
-        status: 'confirmed',
-      },
+      data: { slot_id, application_id: applicationId, status: 'confirmed' },
     });
   } catch (err) {
-    console.error('[confirm] Unexpected error:', err);
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    );
+    console.error('[confirm POST] Error:', err);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
 
-/**
- * GET /api/interviews/[id]/confirm
- * 
- * Returns the available interview slots for a candidate to choose from.
- * [id] is the application ID.
- */
 export async function GET(
-  request: Request,
+  _request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
   try {
     const { id: applicationId } = await params;
-    const supabase = createServiceRoleClient();
+    const db = getDb();
 
-    // Fetch application with candidate and job info
-    const { data: application } = await supabase
-      .from('applications')
-      .select('id, candidate_id, job_posting_id, status')
-      .eq('id', applicationId)
-      .single();
+    const [application] = await db
+      .select()
+      .from(applications)
+      .where(eq(applications.id, applicationId))
+      .limit(1);
 
     if (!application) {
-      return NextResponse.json(
-        { error: 'Application not found' },
-        { status: 404 }
-      );
+      return NextResponse.json({ error: 'Application not found' }, { status: 404 });
     }
 
-    const [candidateRes, jobRes, slotsRes] = await Promise.all([
-      supabase
-        .from('candidates')
-        .select('full_name, email')
-        .eq('id', application.candidate_id)
-        .single(),
-      supabase
-        .from('job_postings')
-        .select('title')
-        .eq('id', application.job_posting_id)
-        .single(),
-      supabase
-        .from('interview_slots')
-        .select('*')
-        .eq('application_id', applicationId)
-        .order('proposed_start', { ascending: true }),
+    const [candidateRows, jobRows, slotRows] = await Promise.all([
+      db.select().from(candidates).where(eq(candidates.id, application.candidateId)),
+      db.select().from(jobPostings).where(eq(jobPostings.id, application.jobPostingId)),
+      db.select().from(interviewSlots).where(eq(interviewSlots.applicationId, applicationId)),
     ]);
 
     return NextResponse.json({
       data: {
         application_id: applicationId,
-        candidate_name: candidateRes.data?.full_name ?? 'Candidate',
-        job_title: jobRes.data?.title ?? 'Position',
-        slots: slotsRes.data ?? [],
-        already_confirmed: (slotsRes.data ?? []).some(
-          (s: { status: string }) => s.status === 'confirmed'
-        ),
+        candidate_name: candidateRows[0]?.fullName ?? 'Candidate',
+        job_title: jobRows[0]?.title ?? 'Position',
+        slots: slotRows,
+        already_confirmed: slotRows.some((s) => s.status === 'confirmed'),
       },
     });
   } catch (err) {
-    console.error('[GET confirm] Unexpected error:', err);
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    );
+    console.error('[confirm GET] Error:', err);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }

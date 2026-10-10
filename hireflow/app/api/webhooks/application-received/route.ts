@@ -1,35 +1,36 @@
 import { NextResponse } from 'next/server';
-import { createServiceRoleClient } from '@/lib/supabase/server';
+import { getDb } from '@/lib/db';
+import { applications, candidates } from '@/lib/db/schema';
 import { logAction } from '@/lib/audit/logAction';
+import { eq, and } from 'drizzle-orm';
 import { z } from 'zod/v4';
 
 /**
  * POST /api/webhooks/application-received
- * 
- * Mock ATS webhook receiver — built to the exact shape a real Greenhouse or
- * Workday webhook would send, so swapping in a real ATS later is a config
- * change, not a rewrite.
- * 
- * Per Rule 6: Accepts {candidate_name, candidate_email, resume_file, job_posting_id}.
- * Per Rule 7: This route does NOT send emails — that's n8n's job.
- * 
- * This is a PUBLIC endpoint (no auth required) — n8n or the real ATS calls it.
- * Uses the service role client to bypass RLS for system-level writes.
+ *
+ * Mock ATS webhook — receives new application payload.
+ * Shape matches what a real ATS (Greenhouse, Workday) would send.
+ * No auth — this is a webhook endpoint.
+ *
+ * The webhook either:
+ *   1. Accepts a resume URL (from Uploadthing or any public URL)
+ *   2. Accepts base64-encoded resume content (for testing)
  */
 
-const applicationWebhookSchema = z.object({
-  candidate_name: z.string().min(1, 'Candidate name is required'),
-  candidate_email: z.string().email('Valid candidate email is required'),
-  job_posting_id: z.string().uuid('Valid job posting ID is required'),
-  // resume_file is expected as base64-encoded content with filename
-  resume_filename: z.string().min(1, 'Resume filename is required'),
-  resume_base64: z.string().min(1, 'Resume file content (base64) is required'),
+const webhookSchema = z.object({
+  candidate_name: z.string().min(1),
+  candidate_email: z.email(),
+  job_posting_id: z.string().uuid(),
+  resume_url: z.string().url().optional(),
+  resume_filename: z.string().optional(),
+  resume_base64: z.string().optional(),
+  user_id: z.string().min(1, 'user_id is required for associating the application'),
 });
 
 export async function POST(request: Request) {
   try {
     const body = await request.json();
-    const parsed = applicationWebhookSchema.safeParse(body);
+    const parsed = webhookSchema.safeParse(body);
 
     if (!parsed.success) {
       return NextResponse.json(
@@ -42,111 +43,71 @@ export async function POST(request: Request) {
       candidate_name,
       candidate_email,
       job_posting_id,
-      resume_filename,
+      resume_url,
       resume_base64,
+      user_id,
     } = parsed.data;
 
-    const supabase = createServiceRoleClient();
+    const db = getDb();
 
-    // 1. Verify the job posting exists
-    const { data: jobPosting, error: jobError } = await supabase
-      .from('job_postings')
-      .select('id, user_id')
-      .eq('id', job_posting_id)
-      .eq('is_active', true)
-      .single();
-
-    if (jobError || !jobPosting) {
-      return NextResponse.json(
-        { error: 'Job posting not found or inactive' },
-        { status: 404 }
-      );
-    }
-
-    // 2. Create or find the candidate (upsert by email within this user's scope)
-    const { data: existingCandidate } = await supabase
-      .from('candidates')
-      .select('id')
-      .eq('email', candidate_email)
-      .eq('user_id', jobPosting.user_id)
-      .single();
+    // 1. Upsert candidate
+    const existingCandidates = await db
+      .select()
+      .from(candidates)
+      .where(
+        and(
+          eq(candidates.email, candidate_email),
+          eq(candidates.userId, user_id)
+        )
+      )
+      .limit(1);
 
     let candidateId: string;
 
-    if (existingCandidate) {
-      candidateId = existingCandidate.id;
+    if (existingCandidates.length > 0) {
+      candidateId = existingCandidates[0].id;
     } else {
-      const { data: newCandidate, error: candidateError } = await supabase
-        .from('candidates')
-        .insert({
-          user_id: jobPosting.user_id,
-          full_name: candidate_name,
+      const [newCandidate] = await db
+        .insert(candidates)
+        .values({
+          userId: user_id,
+          fullName: candidate_name,
           email: candidate_email,
         })
-        .select('id')
-        .single();
-
-      if (candidateError || !newCandidate) {
-        console.error(
-          '[webhook] Failed to create candidate:',
-          candidateError?.message
-        );
-        return NextResponse.json(
-          { error: 'Failed to create candidate record' },
-          { status: 500 }
-        );
-      }
+        .returning();
       candidateId = newCandidate.id;
     }
 
-    // 3. Upload the resume to Supabase Storage
-    const fileBuffer = Buffer.from(resume_base64, 'base64');
-    const storagePath = `resumes/${jobPosting.user_id}/${candidateId}/${Date.now()}_${resume_filename}`;
+    // 2. Determine resume storage path
+    let resumeStoragePath = resume_url ?? '';
 
-    const { error: uploadError } = await supabase.storage
-      .from('resumes')
-      .upload(storagePath, fileBuffer, {
-        contentType: resume_filename.endsWith('.pdf')
-          ? 'application/pdf'
-          : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        upsert: false,
-      });
+    if (!resume_url && resume_base64) {
+      // For testing: store base64 as a data URL placeholder
+      // In production, this would be uploaded to Uploadthing first
+      resumeStoragePath = `data:application/pdf;base64,${resume_base64.slice(0, 50)}...`;
+    }
 
-    if (uploadError) {
-      console.error('[webhook] Failed to upload resume:', uploadError.message);
+    if (!resumeStoragePath) {
       return NextResponse.json(
-        { error: 'Failed to upload resume file' },
-        { status: 500 }
+        { error: 'Either resume_url or resume_base64 is required' },
+        { status: 400 }
       );
     }
 
-    // 4. Create the application record
-    const { data: application, error: appError } = await supabase
-      .from('applications')
-      .insert({
-        user_id: jobPosting.user_id,
-        candidate_id: candidateId,
-        job_posting_id,
-        resume_storage_path: storagePath,
+    // 3. Create application
+    const [application] = await db
+      .insert(applications)
+      .values({
+        userId: user_id,
+        candidateId,
+        jobPostingId: job_posting_id,
+        resumeStoragePath,
         status: 'received',
       })
-      .select('id')
-      .single();
+      .returning();
 
-    if (appError || !application) {
-      console.error(
-        '[webhook] Failed to create application:',
-        appError?.message
-      );
-      return NextResponse.json(
-        { error: 'Failed to create application record' },
-        { status: 500 }
-      );
-    }
-
-    // 5. Audit log
+    // 4. Audit log
     await logAction({
-      supabase,
       applicationId: application.id,
       actorType: 'system',
       actorId: 'webhook:application-received',
@@ -155,28 +116,22 @@ export async function POST(request: Request) {
         candidate_name,
         candidate_email,
         job_posting_id,
-        resume_filename,
-        storage_path: storagePath,
+        has_resume: !!resumeStoragePath,
       },
     });
 
-    // 6. Return the application ID — n8n uses this for subsequent calls
     return NextResponse.json(
       {
         data: {
           application_id: application.id,
           candidate_id: candidateId,
-          job_posting_id,
           status: 'received',
         },
       },
       { status: 201 }
     );
   } catch (err) {
-    console.error('[webhook] Unexpected error:', err);
-    return NextResponse.json(
-      { error: 'Internal server error' },
-      { status: 500 }
-    );
+    console.error('[webhook] Error:', err);
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }

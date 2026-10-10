@@ -1,5 +1,6 @@
 import type { Metadata } from 'next';
 import { Inter, IBM_Plex_Mono } from 'next/font/google';
+import { ClerkProvider } from '@clerk/nextjs';
 import './globals.css';
 
 const inter = Inter({
@@ -23,13 +24,19 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: LayoutProps<'/'>) {
   return (
-    <html
-      lang="en"
-      className={`${inter.variable} ${ibmPlexMono.variable} h-full antialiased`}
+    <ClerkProvider
+      signInUrl="/login"
+      signUpUrl="/signup"
+      afterSignOutUrl="/login"
     >
-      <body className="min-h-full flex flex-col bg-[#F7F8FA] text-[#1F2933] font-sans">
-        {children}
-      </body>
-    </html>
+      <html
+        lang="en"
+        className={`${inter.variable} ${ibmPlexMono.variable} h-full antialiased`}
+      >
+        <body className="min-h-full flex flex-col bg-[#F7F8FA] text-[#1F2933] font-sans">
+          {children}
+        </body>
+      </html>
+    </ClerkProvider>
   );
 }

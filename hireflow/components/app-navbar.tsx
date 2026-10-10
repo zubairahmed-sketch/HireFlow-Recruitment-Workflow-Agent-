@@ -1,26 +1,21 @@
 'use client';
 
 import Link from 'next/link';
-import { usePathname, useRouter } from 'next/navigation';
-import { createClient } from '@/lib/supabase/client';
-import { Button } from '@/components/ui/button';
-import { LayoutDashboard, Briefcase, LogOut } from 'lucide-react';
+import { usePathname } from 'next/navigation';
+import { UserButton } from '@clerk/nextjs';
+import { LayoutDashboard, Briefcase } from 'lucide-react';
 
 const navItems = [
   { href: '/dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { href: '/jobs', label: 'Job Postings', icon: Briefcase },
 ];
 
-export function AppNavbar({ userEmail }: { userEmail: string }) {
+/**
+ * App navigation bar — now uses Clerk's UserButton for auth.
+ * No more manual sign-out handler or Supabase client.
+ */
+export function AppNavbar() {
   const pathname = usePathname();
-  const router = useRouter();
-  const supabase = createClient();
-
-  async function handleSignOut() {
-    await supabase.auth.signOut();
-    router.push('/login');
-    router.refresh();
-  }
 
   return (
     <header className="sticky top-0 z-50 w-full border-b border-[#E4E7EB] bg-white/95 backdrop-blur supports-[backdrop-filter]:bg-white/80">
@@ -74,20 +69,16 @@ export function AppNavbar({ userEmail }: { userEmail: string }) {
           })}
         </nav>
 
-        {/* Right side: user info + sign out */}
+        {/* Right side: Clerk UserButton */}
         <div className="ml-auto flex items-center gap-3">
-          <span className="text-xs text-[#627D98] font-mono hidden md:inline-block">
-            {userEmail}
-          </span>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={handleSignOut}
-            className="text-[#627D98] hover:text-[#1F2933] gap-1.5"
-          >
-            <LogOut className="w-4 h-4" />
-            <span className="hidden sm:inline">Sign out</span>
-          </Button>
+          <UserButton
+            afterSignOutUrl="/login"
+            appearance={{
+              elements: {
+                avatarBox: 'w-8 h-8',
+              },
+            }}
+          />
         </div>
       </div>
     </header>

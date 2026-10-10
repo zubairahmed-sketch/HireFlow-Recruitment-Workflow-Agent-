@@ -1,5 +1,7 @@
 import { NextResponse } from 'next/server';
-import { createServiceRoleClient } from '@/lib/supabase/server';
+import { getDb } from '@/lib/db';
+import { applications, candidates, jobPostings } from '@/lib/db/schema';
+import { eq } from 'drizzle-orm';
 import { draftEmail } from '@/lib/scoring/draftEmail';
 import { logAction } from '@/lib/audit/logAction';
 import { logTokenUsage } from '@/lib/openai/logTokenUsage';
@@ -7,13 +9,7 @@ import { z } from 'zod/v4';
 
 /**
  * POST /api/emails/draft
- *
- * Call 2: Draft a rejection or interview-invite email.
- * Called by n8n to get a copy draft that a human has already approved indirectly
- * (by making the Approve/Reject decision). Draft is logged for auditability.
- *
- * Per Rule 2: The email is only sent by n8n's email nodes — never from here.
- * Per Rule 8: This is Call 2 of the 3 allowed LLM calls.
+ * Call 2: Draft email copy for the human-approved decision.
  */
 
 const draftSchema = z.object({
@@ -35,43 +31,37 @@ export async function POST(request: Request) {
     }
 
     const { application_id, decision_type, notes } = parsed.data;
-    const supabase = createServiceRoleClient();
+    const db = getDb();
 
-    // Fetch candidate + job info
-    const { data: application } = await supabase
-      .from('applications')
-      .select('id, candidate_id, job_posting_id, user_id')
-      .eq('id', application_id)
-      .single();
+    const [application] = await db
+      .select()
+      .from(applications)
+      .where(eq(applications.id, application_id))
+      .limit(1);
 
     if (!application) {
       return NextResponse.json({ error: 'Application not found' }, { status: 404 });
     }
 
-    const [candidateRes, jobRes] = await Promise.all([
-      supabase.from('candidates').select('full_name').eq('id', application.candidate_id).single(),
-      supabase.from('job_postings').select('title').eq('id', application.job_posting_id).single(),
+    const [candidateRows, jobRows] = await Promise.all([
+      db.select().from(candidates).where(eq(candidates.id, application.candidateId)),
+      db.select().from(jobPostings).where(eq(jobPostings.id, application.jobPostingId)),
     ]);
 
-    // Call 2: Draft the email
     const result = await draftEmail({
       decisionType: decision_type,
-      candidateName: candidateRes.data?.full_name ?? 'Candidate',
-      jobTitle: jobRes.data?.title ?? 'Position',
+      candidateName: candidateRows[0]?.fullName ?? 'Candidate',
+      jobTitle: jobRows[0]?.title ?? 'Position',
       notes,
     });
 
-    // Log token usage (Rule 11)
     await logTokenUsage({
-      supabase,
-      userId: application.user_id,
+      userId: application.userId,
       callType: 'email_drafting',
       tokensUsed: result.tokensUsed,
     });
 
-    // Audit log
     await logAction({
-      supabase,
       applicationId: application_id,
       actorType: 'llm',
       actorId: 'gpt-4o-mini',
@@ -92,7 +82,7 @@ export async function POST(request: Request) {
       },
     });
   } catch (err) {
-    console.error('[email/draft] Unexpected error:', err);
+    console.error('[email/draft] Error:', err);
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }

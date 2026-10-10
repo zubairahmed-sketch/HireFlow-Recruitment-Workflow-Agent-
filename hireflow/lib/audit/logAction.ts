@@ -1,42 +1,35 @@
-import type { SupabaseClient } from '@supabase/supabase-js';
-import type { AuditActorType } from '@/lib/types';
-
 /**
- * Append an entry to the audit_log table.
- * This is the single helper called after every meaningful action in the system.
- *
- * Uses the service role client to bypass RLS — audit entries are system-level records.
- * The audit_log table has no UPDATE or DELETE policies; entries are permanent.
+ * Append-only audit log helper — uses Drizzle ORM.
+ * Called after every meaningful action in the system.
  */
+
+import { getDb } from '@/lib/db';
+import { auditLog } from '@/lib/db/schema';
+
 export async function logAction({
-  supabase,
   applicationId,
   actorType,
   actorId,
   action,
   details,
 }: {
-  supabase: SupabaseClient;
-  applicationId: string | null;
-  actorType: AuditActorType;
-  actorId: string | null;
+  applicationId: string;
+  actorType: 'system' | 'llm' | 'human';
+  actorId: string;
   action: string;
   details?: Record<string, unknown>;
-}): Promise<void> {
-  const { error } = await supabase.from('audit_log').insert({
-    application_id: applicationId,
-    actor_type: actorType,
-    actor_id: actorId,
-    action,
-    details: details ?? null,
-  });
-
-  if (error) {
-    // Log but don't throw — audit logging should never break the primary operation
-    console.error('[audit_log] Failed to write audit entry:', error.message, {
+}) {
+  try {
+    const db = getDb();
+    await db.insert(auditLog).values({
       applicationId,
       actorType,
+      actorId,
       action,
+      details: details ?? null,
     });
+  } catch (err) {
+    console.error('[audit] Failed to log action:', err);
+    // Audit logging should never crash the calling operation
   }
 }
