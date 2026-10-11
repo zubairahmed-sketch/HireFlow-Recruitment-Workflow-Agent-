@@ -1,13 +1,10 @@
 import { NextResponse } from 'next/server';
-import { createServiceRoleClient } from '@/lib/supabase/server';
 import { logAction } from '@/lib/audit/logAction';
 import { z } from 'zod/v4';
 
 /**
  * POST /api/interviews/reminders/log
- *
- * Called by n8n after sending a reminder email to a candidate.
- * Writes to audit_log so recruiters can see exactly when reminders were sent.
+ * Called by n8n after sending a reminder email. Writes to audit_log.
  */
 
 const logSchema = z.object({
@@ -28,22 +25,18 @@ export async function POST(request: Request) {
     }
 
     const { application_id, action } = parsed.data;
-    const supabase = createServiceRoleClient();
 
     await logAction({
-      supabase,
       applicationId: application_id,
       actorType: 'system',
       actorId: 'n8n:reminder-workflow',
       action,
-      details: {
-        sent_at: new Date().toISOString(),
-      },
+      details: { sent_at: new Date().toISOString() },
     });
 
     return NextResponse.json({ data: { logged: true } });
   } catch (err) {
-    console.error('[reminders/log] Unexpected error:', err);
+    console.error('[reminders/log] Error:', err);
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }

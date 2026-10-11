@@ -1,4 +1,13 @@
-import { createClient } from '@/lib/supabase/server';
+import { auth } from '@clerk/nextjs/server';
+import { getDb } from '@/lib/db';
+import {
+  applications,
+  candidates,
+  jobPostings,
+  resumeScores,
+  interviewSlots,
+} from '@/lib/db/schema';
+import { eq, and, sql } from 'drizzle-orm';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import {
@@ -15,49 +24,29 @@ import Link from 'next/link';
 /**
  * Dashboard page — the review queue.
  * Shows scored candidates awaiting human review.
- * Sortable by score, filterable by job and status.
  */
 export default async function DashboardPage() {
-  const supabase = await createClient();
+  const { userId } = await auth();
+  if (!userId) return null;
+
+  const db = getDb();
 
   // Fetch stats
-  const [jobsResult, pendingResult, candidatesResult, interviewsResult] =
-    await Promise.all([
-      supabase
-        .from('job_postings')
-        .select('id', { count: 'exact', head: true })
-        .eq('is_active', true),
-      supabase
-        .from('applications')
-        .select('id', { count: 'exact', head: true })
-        .eq('status', 'pending_review'),
-      supabase.from('candidates').select('id', { count: 'exact', head: true }),
-      supabase
-        .from('interview_slots')
-        .select('id', { count: 'exact', head: true })
-        .eq('status', 'confirmed'),
-    ]);
+  const [allJobs, allApps, allCandidates, allSlots] = await Promise.all([
+    db.select().from(jobPostings).where(and(eq(jobPostings.userId, userId), eq(jobPostings.isActive, true))),
+    db.select().from(applications).where(eq(applications.userId, userId)),
+    db.select().from(candidates).where(eq(candidates.userId, userId)),
+    db.select().from(interviewSlots).where(eq(interviewSlots.status, 'confirmed')),
+  ]);
 
   const stats = {
-    activeJobs: jobsResult.count ?? 0,
-    pendingReview: pendingResult.count ?? 0,
-    totalCandidates: candidatesResult.count ?? 0,
-    interviewsScheduled: interviewsResult.count ?? 0,
+    activeJobs: allJobs.length,
+    pendingReview: allApps.filter((a) => a.status === 'pending_review').length,
+    totalCandidates: allCandidates.length,
+    interviewsScheduled: allSlots.length,
   };
 
-  // Fetch applications with related data for the queue
-  const { data: applications } = await supabase
-    .from('applications')
-    .select(`
-      id,
-      status,
-      created_at,
-      candidate_id,
-      job_posting_id
-    `)
-    .order('created_at', { ascending: false });
-
-  // Fetch related data separately (Supabase doesn't support deep joins without foreign key setup)
+  // Enrich applications with candidate, job, and score data
   let enrichedApps: Array<{
     id: string;
     status: string;
@@ -69,42 +58,35 @@ export default async function DashboardPage() {
     recommendation: string | null;
   }> = [];
 
-  if (applications && applications.length > 0) {
-    const candidateIds = [...new Set(applications.map((a) => a.candidate_id))];
-    const jobIds = [...new Set(applications.map((a) => a.job_posting_id))];
-    const appIds = applications.map((a) => a.id);
+  if (allApps.length > 0) {
+    const candidateMap = new Map(allCandidates.map((c) => [c.id, c]));
+    const jobMap = new Map(allJobs.map((j) => [j.id, j]));
 
-    const [candidatesRes, jobsRes, scoresRes] = await Promise.all([
-      supabase.from('candidates').select('id, full_name, email').in('id', candidateIds),
-      supabase.from('job_postings').select('id, title').in('id', jobIds),
-      supabase
-        .from('resume_scores')
-        .select('application_id, overall_score, recommendation')
-        .in('application_id', appIds),
-    ]);
-
-    const candidateMap = new Map(
-      (candidatesRes.data ?? []).map((c) => [c.id, c])
-    );
-    const jobMap = new Map(
-      (jobsRes.data ?? []).map((j) => [j.id, j])
+    // Fetch scores for all apps
+    const appIds = allApps.map((a) => a.id);
+    const allScores = await Promise.all(
+      appIds.map((id) =>
+        db.select().from(resumeScores).where(eq(resumeScores.applicationId, id)).limit(1)
+      )
     );
     const scoreMap = new Map(
-      (scoresRes.data ?? []).map((s) => [s.application_id, s])
+      allScores
+        .filter((rows) => rows.length > 0)
+        .map((rows) => [rows[0].applicationId, rows[0]])
     );
 
-    enrichedApps = applications.map((app) => {
-      const candidate = candidateMap.get(app.candidate_id);
-      const job = jobMap.get(app.job_posting_id);
+    enrichedApps = allApps.map((app) => {
+      const candidate = candidateMap.get(app.candidateId);
+      const job = jobMap.get(app.jobPostingId);
       const score = scoreMap.get(app.id);
       return {
         id: app.id,
         status: app.status,
-        created_at: app.created_at,
-        candidate_name: candidate?.full_name ?? 'Unknown',
+        created_at: app.createdAt?.toISOString() ?? new Date().toISOString(),
+        candidate_name: candidate?.fullName ?? 'Unknown',
         candidate_email: candidate?.email ?? '',
         job_title: job?.title ?? 'Unknown',
-        overall_score: score?.overall_score ?? null,
+        overall_score: score?.overallScore ? Number(score.overallScore) : null,
         recommendation: score?.recommendation ?? null,
       };
     });
@@ -277,18 +259,9 @@ function RecommendationBadge({ value }: { value: string | null }) {
   if (!value) return <span className="text-[#9FB3C8]">—</span>;
 
   const config: Record<string, { label: string; className: string }> = {
-    advance: {
-      label: 'Advance',
-      className: 'bg-[#E6F7F3] text-[#0F6E5C]',
-    },
-    reject: {
-      label: 'Reject',
-      className: 'bg-red-50 text-red-700',
-    },
-    unclear: {
-      label: 'Unclear',
-      className: 'bg-amber-50 text-amber-700',
-    },
+    advance: { label: 'Advance', className: 'bg-[#E6F7F3] text-[#0F6E5C]' },
+    reject: { label: 'Reject', className: 'bg-red-50 text-red-700' },
+    unclear: { label: 'Unclear', className: 'bg-amber-50 text-amber-700' },
   };
 
   const c = config[value] ?? { label: value, className: 'bg-gray-100 text-gray-600' };
@@ -304,20 +277,11 @@ function StatusBadge({ value }: { value: string }) {
   const config: Record<string, { label: string; className: string }> = {
     received: { label: 'Received', className: 'bg-gray-100 text-gray-600' },
     scored: { label: 'Scored', className: 'bg-blue-50 text-blue-700' },
-    pending_review: {
-      label: 'Pending Review',
-      className: 'bg-amber-50 text-amber-700',
-    },
+    pending_review: { label: 'Pending Review', className: 'bg-amber-50 text-amber-700' },
     approved: { label: 'Approved', className: 'bg-[#E6F7F3] text-[#0F6E5C]' },
     rejected: { label: 'Rejected', className: 'bg-red-50 text-red-700' },
-    more_info: {
-      label: 'More Info',
-      className: 'bg-purple-50 text-purple-700',
-    },
-    interview_scheduled: {
-      label: 'Interview',
-      className: 'bg-blue-50 text-blue-700',
-    },
+    more_info: { label: 'More Info', className: 'bg-purple-50 text-purple-700' },
+    interview_scheduled: { label: 'Interview', className: 'bg-blue-50 text-blue-700' },
   };
 
   const c = config[value] ?? { label: value, className: 'bg-gray-100 text-gray-600' };

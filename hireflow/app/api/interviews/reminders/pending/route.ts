@@ -1,39 +1,13 @@
 import { NextResponse } from 'next/server';
-import { createServiceRoleClient } from '@/lib/supabase/server';
+import { getDb } from '@/lib/db';
+import { interviewSlots, applications, candidates, jobPostings } from '@/lib/db/schema';
+import { eq, lt } from 'drizzle-orm';
 
 /**
  * GET /api/interviews/reminders/pending
- *
- * Called by n8n's reminder sub-workflow (daily schedule).
- * Returns applications with unconfirmed slots older than 48 hours.
- * Protected by a simple bearer token (N8N_SERVICE_TOKEN).
+ * Called by n8n's daily reminder workflow.
+ * Returns applications with unconfirmed slots older than 48h.
  */
-
-interface SlotRow {
-  id: string;
-  application_id: string;
-  proposed_start: string;
-  proposed_end: string;
-  created_at: string;
-}
-
-interface ApplicationRow {
-  id: string;
-  candidate_id: string;
-  job_posting_id: string;
-}
-
-interface CandidateRow {
-  id: string;
-  full_name: string;
-  email: string;
-}
-
-interface JobRow {
-  id: string;
-  title: string;
-}
-
 export async function GET(request: Request) {
   const authHeader = request.headers.get('Authorization');
   const expectedToken = process.env.N8N_SERVICE_TOKEN;
@@ -42,63 +16,55 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
   }
 
-  const supabase = createServiceRoleClient();
-  const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+  const db = getDb();
+  const cutoff = new Date(Date.now() - 48 * 60 * 60 * 1000);
 
-  const { data: slots, error } = await supabase
-    .from('interview_slots')
-    .select('id, application_id, proposed_start, proposed_end, created_at')
-    .eq('status', 'offered')
-    .lt('created_at', cutoff);
+  const slots = await db
+    .select()
+    .from(interviewSlots)
+    .where(eq(interviewSlots.status, 'offered'));
 
-  if (error) {
-    console.error('[reminders/pending] Error:', error.message);
-    return NextResponse.json({ error: 'Failed to fetch pending slots' }, { status: 500 });
-  }
+  // Filter to slots created more than 48h ago
+  const oldSlots = slots.filter(
+    (s) => s.createdAt && new Date(s.createdAt) < cutoff
+  );
 
-  const typedSlots = (slots ?? []) as SlotRow[];
-  if (typedSlots.length === 0) {
+  if (oldSlots.length === 0) {
     return NextResponse.json({ data: [] });
   }
 
-  // Deduplicate by application_id
-  const appIds = [...new Set(typedSlots.map((s: SlotRow) => s.application_id))];
+  const appIds = [...new Set(oldSlots.map((s) => s.applicationId))];
 
-  const { data: applications } = await supabase
-    .from('applications')
-    .select('id, candidate_id, job_posting_id')
-    .in('id', appIds);
+  const result = await Promise.all(
+    appIds.map(async (appId) => {
+      const [app] = await db
+        .select()
+        .from(applications)
+        .where(eq(applications.id, appId))
+        .limit(1);
 
-  const typedApps = (applications ?? []) as ApplicationRow[];
-  if (typedApps.length === 0) {
-    return NextResponse.json({ data: [] });
-  }
+      if (!app) return null;
 
-  const candidateIds = typedApps.map((a: ApplicationRow) => a.candidate_id);
-  const jobIds = typedApps.map((a: ApplicationRow) => a.job_posting_id);
+      const [candidate] = await db
+        .select()
+        .from(candidates)
+        .where(eq(candidates.id, app.candidateId))
+        .limit(1);
 
-  const [candidatesRes, jobsRes] = await Promise.all([
-    supabase.from('candidates').select('id, full_name, email').in('id', candidateIds),
-    supabase.from('job_postings').select('id, title').in('id', jobIds),
-  ]);
+      const [job] = await db
+        .select()
+        .from(jobPostings)
+        .where(eq(jobPostings.id, app.jobPostingId))
+        .limit(1);
 
-  const candidateMap = new Map(
-    ((candidatesRes.data ?? []) as CandidateRow[]).map((c: CandidateRow) => [c.id, c])
+      return {
+        application_id: app.id,
+        candidate_name: candidate?.fullName ?? 'Candidate',
+        candidate_email: candidate?.email ?? '',
+        job_title: job?.title ?? 'Position',
+      };
+    })
   );
-  const jobMap = new Map(
-    ((jobsRes.data ?? []) as JobRow[]).map((j: JobRow) => [j.id, j])
-  );
 
-  const result = typedApps.map((app: ApplicationRow) => {
-    const candidate = candidateMap.get(app.candidate_id);
-    const job = jobMap.get(app.job_posting_id);
-    return {
-      application_id: app.id,
-      candidate_name: candidate?.full_name ?? 'Candidate',
-      candidate_email: candidate?.email ?? '',
-      job_title: job?.title ?? 'Position',
-    };
-  });
-
-  return NextResponse.json({ data: result });
+  return NextResponse.json({ data: result.filter(Boolean) });
 }

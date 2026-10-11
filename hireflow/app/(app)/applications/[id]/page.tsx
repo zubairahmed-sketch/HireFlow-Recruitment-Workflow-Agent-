@@ -1,5 +1,14 @@
-import { createClient } from '@/lib/supabase/server';
 import { notFound } from 'next/navigation';
+import { getDb } from '@/lib/db';
+import {
+  applications,
+  candidates,
+  jobPostings,
+  resumeScores,
+  humanDecisions,
+  auditLog as auditLogTable,
+} from '@/lib/db/schema';
+import { eq } from 'drizzle-orm';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Separator } from '@/components/ui/separator';
@@ -29,55 +38,34 @@ export default async function ApplicationDetailPage({
   params: Promise<{ id: string }>;
 }) {
   const { id } = await params;
-  const supabase = await createClient();
+  const db = getDb();
 
-  // Fetch all related data
-  const { data: application } = await supabase
-    .from('applications')
-    .select('*')
-    .eq('id', id)
-    .single();
+  // Fetch application
+  const [application] = await db
+    .select()
+    .from(applications)
+    .where(eq(applications.id, id))
+    .limit(1);
 
   if (!application) {
     notFound();
   }
 
-  const [candidateRes, jobRes, scoreRes, decisionsRes, auditRes] =
+  // Fetch all related data in parallel
+  const [candidateRows, jobRows, scoreRows, decisionRows, auditRows] =
     await Promise.all([
-      supabase
-        .from('candidates')
-        .select('*')
-        .eq('id', application.candidate_id)
-        .single(),
-      supabase
-        .from('job_postings')
-        .select('*')
-        .eq('id', application.job_posting_id)
-        .single(),
-      supabase
-        .from('resume_scores')
-        .select('*')
-        .eq('application_id', id)
-        .order('created_at', { ascending: false })
-        .limit(1)
-        .single(),
-      supabase
-        .from('human_decisions')
-        .select('*')
-        .eq('application_id', id)
-        .order('decided_at', { ascending: false }),
-      supabase
-        .from('audit_log')
-        .select('*')
-        .eq('application_id', id)
-        .order('created_at', { ascending: true }),
+      db.select().from(candidates).where(eq(candidates.id, application.candidateId)),
+      db.select().from(jobPostings).where(eq(jobPostings.id, application.jobPostingId)),
+      db.select().from(resumeScores).where(eq(resumeScores.applicationId, id)),
+      db.select().from(humanDecisions).where(eq(humanDecisions.applicationId, id)),
+      db.select().from(auditLogTable).where(eq(auditLogTable.applicationId, id)),
     ]);
 
-  const candidate = candidateRes.data;
-  const jobPosting = jobRes.data;
-  const resumeScore = scoreRes.data;
-  const decisions = decisionsRes.data ?? [];
-  const auditLog = auditRes.data ?? [];
+  const candidate = candidateRows[0] ?? null;
+  const jobPosting = jobRows[0] ?? null;
+  const resumeScore = scoreRows[0] ?? null;
+  const decisions = decisionRows;
+  const auditLog = auditRows;
 
   const canDecide =
     application.status === 'pending_review' ||
@@ -98,7 +86,7 @@ export default async function ApplicationDetailPage({
       <div className="flex items-start justify-between">
         <div>
           <h1 className="text-2xl font-bold tracking-tight text-[#1F2933]">
-            {candidate?.full_name ?? 'Unknown Candidate'}
+            {candidate?.fullName ?? 'Unknown Candidate'}
           </h1>
           <p className="text-sm text-[#627D98] mt-1">
             {candidate?.email} · Applied for{' '}
@@ -120,9 +108,9 @@ export default async function ApplicationDetailPage({
               <CardDescription>Extracted text from the uploaded resume</CardDescription>
             </CardHeader>
             <CardContent>
-              {application.resume_text ? (
+              {application.resumeText ? (
                 <pre className="whitespace-pre-wrap text-sm text-[#334E68] font-sans leading-relaxed max-h-[500px] overflow-y-auto bg-[#F7F8FA] rounded-lg p-4 border border-[#E4E7EB]">
-                  {application.resume_text}
+                  {application.resumeText}
                 </pre>
               ) : (
                 <p className="text-sm text-[#9FB3C8] italic">
@@ -142,17 +130,17 @@ export default async function ApplicationDetailPage({
                 <div className="flex items-center justify-between">
                   <CardTitle className="text-base">Score Breakdown</CardTitle>
                   <div className="flex items-center gap-3">
-                    <RecommendationBadge value={resumeScore.recommendation} />
+                    <RecommendationBadge value={resumeScore.recommendation ?? ''} />
                     <span
                       className={`text-2xl font-bold font-mono ${
-                        resumeScore.overall_score >= 70
+                        Number(resumeScore.overallScore) >= 70
                           ? 'text-[#0F6E5C]'
-                          : resumeScore.overall_score >= 40
+                          : Number(resumeScore.overallScore) >= 40
                           ? 'text-amber-600'
                           : 'text-red-600'
                       }`}
                     >
-                      {resumeScore.overall_score}
+                      {resumeScore.overallScore}
                     </span>
                   </div>
                 </div>
@@ -162,7 +150,7 @@ export default async function ApplicationDetailPage({
               </CardHeader>
               <CardContent>
                 <div className="space-y-3">
-                  {(resumeScore.criteria_results as CriterionResult[]).map(
+                  {(resumeScore.criteriaResults as CriterionResult[]).map(
                     (cr, i) => (
                       <div
                         key={i}
@@ -237,7 +225,7 @@ export default async function ApplicationDetailPage({
                             {d.decision}
                           </span>
                           <span className="text-xs text-[#9FB3C8] font-mono">
-                            {new Date(d.decided_at).toLocaleString()}
+                            {d.decidedAt ? new Date(d.decidedAt).toLocaleString() : ''}
                           </span>
                         </div>
                         {d.notes && (
@@ -282,10 +270,10 @@ export default async function ApplicationDetailPage({
                 {auditLog.map((entry) => (
                   <TableRow key={entry.id}>
                     <TableCell className="font-mono text-xs text-[#627D98]">
-                      {new Date(entry.created_at).toLocaleString()}
+                      {entry.createdAt ? new Date(entry.createdAt).toLocaleString() : ''}
                     </TableCell>
                     <TableCell>
-                      <ActorBadge actorType={entry.actor_type} />
+                      <ActorBadge actorType={entry.actorType} />
                     </TableCell>
                     <TableCell className="text-sm text-[#334E68]">
                       {formatAction(entry.action)}
@@ -312,28 +300,14 @@ function StatusBadge({ value }: { value: string }) {
   const config: Record<string, { label: string; className: string }> = {
     received: { label: 'Received', className: 'bg-gray-100 text-gray-600' },
     scored: { label: 'Scored', className: 'bg-blue-50 text-blue-700' },
-    pending_review: {
-      label: 'Pending Review',
-      className: 'bg-amber-50 text-amber-700',
-    },
+    pending_review: { label: 'Pending Review', className: 'bg-amber-50 text-amber-700' },
     approved: { label: 'Approved', className: 'bg-[#E6F7F3] text-[#0F6E5C]' },
     rejected: { label: 'Rejected', className: 'bg-red-50 text-red-700' },
-    more_info: {
-      label: 'More Info Requested',
-      className: 'bg-purple-50 text-purple-700',
-    },
-    interview_scheduled: {
-      label: 'Interview Scheduled',
-      className: 'bg-blue-50 text-blue-700',
-    },
+    more_info: { label: 'More Info Requested', className: 'bg-purple-50 text-purple-700' },
+    interview_scheduled: { label: 'Interview Scheduled', className: 'bg-blue-50 text-blue-700' },
   };
-
   const c = config[value] ?? { label: value, className: 'bg-gray-100 text-gray-600' };
-  return (
-    <Badge variant="secondary" className={c.className}>
-      {c.label}
-    </Badge>
-  );
+  return <Badge variant="secondary" className={c.className}>{c.label}</Badge>;
 }
 
 function RecommendationBadge({ value }: { value: string }) {
@@ -343,23 +317,15 @@ function RecommendationBadge({ value }: { value: string }) {
     unclear: { label: 'Unclear', className: 'bg-amber-50 text-amber-700' },
   };
   const c = config[value] ?? { label: value, className: 'bg-gray-100 text-gray-600' };
-  return (
-    <Badge variant="secondary" className={`${c.className} text-xs`}>
-      {c.label}
-    </Badge>
-  );
+  return <Badge variant="secondary" className={`${c.className} text-xs`}>{c.label}</Badge>;
 }
 
 function DecisionIcon({ decision }: { decision: string }) {
   switch (decision) {
-    case 'approved':
-      return <CheckCircle2 className="w-4 h-4 text-[#0F6E5C] mt-0.5" />;
-    case 'rejected':
-      return <XCircle className="w-4 h-4 text-red-500 mt-0.5" />;
-    case 'more_info':
-      return <AlertCircle className="w-4 h-4 text-purple-600 mt-0.5" />;
-    default:
-      return <AlertCircle className="w-4 h-4 text-gray-400 mt-0.5" />;
+    case 'approved': return <CheckCircle2 className="w-4 h-4 text-[#0F6E5C] mt-0.5" />;
+    case 'rejected': return <XCircle className="w-4 h-4 text-red-500 mt-0.5" />;
+    case 'more_info': return <AlertCircle className="w-4 h-4 text-purple-600 mt-0.5" />;
+    default: return <AlertCircle className="w-4 h-4 text-gray-400 mt-0.5" />;
   }
 }
 
@@ -369,19 +335,10 @@ function ActorBadge({ actorType }: { actorType: string }) {
     llm: { label: 'LLM', className: 'bg-blue-50 text-blue-700' },
     human: { label: 'Human', className: 'bg-[#E6F7F3] text-[#0F6E5C]' },
   };
-  const c = config[actorType] ?? {
-    label: actorType,
-    className: 'bg-gray-100 text-gray-600',
-  };
-  return (
-    <Badge variant="secondary" className={`${c.className} text-xs`}>
-      {c.label}
-    </Badge>
-  );
+  const c = config[actorType] ?? { label: actorType, className: 'bg-gray-100 text-gray-600' };
+  return <Badge variant="secondary" className={`${c.className} text-xs`}>{c.label}</Badge>;
 }
 
 function formatAction(action: string): string {
-  return action
-    .replace(/_/g, ' ')
-    .replace(/\b\w/g, (c) => c.toUpperCase());
+  return action.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 }
