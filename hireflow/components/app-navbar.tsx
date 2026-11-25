@@ -72,7 +72,6 @@ export function AppNavbar() {
         {/* Right side: Clerk UserButton */}
         <div className="ml-auto flex items-center gap-3">
           <UserButton
-            afterSignOutUrl="/login"
             appearance={{
               elements: {
                 avatarBox: 'w-8 h-8',

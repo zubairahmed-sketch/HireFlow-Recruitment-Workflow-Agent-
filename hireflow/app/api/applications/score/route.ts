@@ -62,7 +62,12 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: 'Job posting not found' }, { status: 404 });
     }
 
-    const criteria = job.criteria as { name: string; description?: string; weight?: number }[];
+    const rawCriteria = job.criteria as { name: string; description?: string; weight?: number }[];
+    const criteria = rawCriteria.map((c) => ({
+      name: c.name,
+      description: c.description ?? '',
+      weight: c.weight ?? 1,
+    }));
 
     // 3. Call 1: Score resume against criteria
     const result = await scoreResume({

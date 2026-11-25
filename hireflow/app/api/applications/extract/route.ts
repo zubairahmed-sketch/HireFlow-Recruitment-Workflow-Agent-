@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { getDb } from '@/lib/db';
 import { applications } from '@/lib/db/schema';
 import { eq } from 'drizzle-orm';
-import { extractText } from '@/lib/resume/extractText';
+import { extractResumeText } from '@/lib/resume/extractText';
 import { logAction } from '@/lib/audit/logAction';
 import { z } from 'zod/v4';
 
@@ -65,8 +65,9 @@ export async function POST(request: Request) {
       resumeUrl.endsWith('.docx') ||
       contentType.includes('wordprocessingml');
 
-    // 3. Extract text
-    const resumeText = await extractText(fileBuffer, isDocx ? 'docx' : 'pdf');
+    // 3. Extract text — extractResumeText expects (buffer, fileName)
+    const syntheticFileName = isDocx ? 'resume.docx' : 'resume.pdf';
+    const resumeText = await extractResumeText(fileBuffer, syntheticFileName);
 
     if (!resumeText || resumeText.trim().length === 0) {
       return NextResponse.json(

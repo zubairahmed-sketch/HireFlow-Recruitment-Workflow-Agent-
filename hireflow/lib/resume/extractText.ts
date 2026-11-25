@@ -37,8 +37,17 @@ async function extractFromPDF(buffer: Buffer): Promise<string> {
   // Dynamic import to avoid issues with pdfjs-dist's worker in Node.js
   const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
 
+  // Disable worker to avoid Turbopack/Webpack bundling issues with the worker file.
+  // In a server-side Node.js context we don't need a worker thread.
+  pdfjsLib.GlobalWorkerOptions.workerSrc = '';
+
   const uint8Array = new Uint8Array(buffer);
-  const loadingTask = pdfjsLib.getDocument({ data: uint8Array });
+  const loadingTask = pdfjsLib.getDocument({
+    data: uint8Array,
+    useWorkerFetch: false,
+    isEvalSupported: false,
+    useSystemFonts: true,
+  });
   const pdf = await loadingTask.promise;
 
   const textParts: string[] = [];

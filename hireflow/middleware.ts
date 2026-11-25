@@ -11,12 +11,13 @@ const isPublicRoute = createRouteMatcher([
   '/login(.*)',
   '/signup(.*)',
   '/api/webhooks/(.*)',          // ATS webhook — no auth
-  '/api/applications/extract',   // n8n calls this
-  '/api/applications/score',     // n8n calls this
+  '/api/applications/(.*)',      // n8n calls extract, score, PATCH, interview-slots
   '/api/emails/draft',           // n8n calls this
   '/api/feedback/generate',      // n8n calls this
   '/api/interviews/(.*)',        // Candidate-facing + n8n reminder calls
+  '/api/audit/(.*)',             // Audit trail — n8n and dashboard
   '/interviews/(.*)/confirm',    // Candidate-facing slot picker
+  '/api/uploadthing(.*)',        // Uploadthing file upload handler
 ]);
 
 export default clerkMiddleware(async (auth, req) => {
