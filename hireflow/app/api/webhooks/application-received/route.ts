@@ -120,6 +120,24 @@ export async function POST(request: Request) {
       },
     });
 
+    // 5. Trigger n8n workflow (fire-and-forget — don't block the webhook response)
+    const n8nWebhookUrl = process.env.N8N_WEBHOOK_URL;
+    if (n8nWebhookUrl) {
+      fetch(n8nWebhookUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          application_id: application.id,
+          candidate_id: candidateId,
+          candidate_name,
+          candidate_email,
+          job_posting_id,
+        }),
+      }).catch((err) => {
+        console.error('[webhook] Failed to trigger n8n workflow:', err);
+      });
+    }
+
     return NextResponse.json(
       {
         data: {
